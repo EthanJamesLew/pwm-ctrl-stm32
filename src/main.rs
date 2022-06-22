@@ -1,4 +1,4 @@
-#![deny(unsafe_code)]
+#![allow(unsafe_code)]
 #![allow(unused_imports)]
 #![no_main]
 #![no_std]
@@ -9,8 +9,8 @@ mod app {
     /// hardware layers imports
     use embedded_hal::spi::{Mode, Phase, Polarity};
     use stm32f4xx_hal::{
-        spi::{Spi, Tx, Rx},
-        pac::{DMA1, SPI3},
+        spi::{Spi},
+        pac::{DMA1, SPI3, USART3},
         gpio::{gpiod::PD12, Output, PushPull},
         dma::{
             StreamsTuple, config::DmaConfig, 
@@ -18,7 +18,10 @@ mod app {
             MemoryToPeripheral, Stream0, Stream5,
             traits::StreamISR
         },
+        interrupt,
+        serial::{config::Config, Tx, Rx, Event::Rxne},
         prelude::*,
+        pac,
     };
     use panic_semihosting as _;
     use systick_monotonic::*;
@@ -27,12 +30,6 @@ mod app {
     /// app constants
     const ARRAY_SIZE: usize = 3;
 
-    type TxTransfer =
-        Transfer<Stream5<DMA1>, 0, Tx<SPI3>, MemoryToPeripheral, &'static mut [u8; ARRAY_SIZE]>;
-
-    type RxTransfer =
-        Transfer<Stream0<DMA1>, 0, Rx<SPI3>, PeripheralToMemory, &'static mut [u8; ARRAY_SIZE]>;
-    
     #[local]
     struct Local {
         tx_buffer: Option<&'static mut [u8; ARRAY_SIZE]>,
@@ -42,8 +39,9 @@ mod app {
     #[shared]
     struct Shared {
         led: PD12<Output<PushPull>>,
-        tx_transfer: TxTransfer,
-        rx_transfer: RxTransfer,
+        led_state: bool,
+        tx_transfer: Tx<USART3, u16>,
+        rx_transfer: Rx<USART3, u16>,
     }
 
     #[monotonic(binds = SysTick, default = true)]
@@ -59,107 +57,62 @@ mod app {
         let device_peripherals: hal::pac::Peripherals = cx.device;
         let rcc = device_peripherals.RCC;
         let rcc = rcc.constrain();
-        let clocks = rcc.cfgr.sysclk(100.MHz()).pclk1(36.MHz()).freeze();
+        let clocks = rcc.cfgr.use_hse(8.MHz()).freeze();
 
         // RTIC monotonic
         let mono = Systick::new(core.SYST, 100_000_000);
-        
-        // Initialize the SPI
-        let gpiob = device_peripherals.GPIOB;
-        let spi = device_peripherals.SPI3;
-        let gpiob = gpiob.split();
 
-        // gpio SPI pins
-        let sck = gpiob.pb3.into_alternate();
-        let miso = gpiob.pb4.into_alternate();
-        let mosi = gpiob.pb5.into_alternate();
+        // define RX/TX pins
+        let gpiod = device_peripherals.GPIOD.split();
+        let tx_pin = gpiod.pd8.into_alternate();
+        let rx_pin = gpiod.pd9.into_alternate();
 
-        // SPI structs and get SPI Tx/Rx
-        let mode = Mode {
-            polarity: Polarity::IdleLow,
-            phase: Phase::CaptureOnFirstTransition,
-        };
+        // configure serial
+        let mut serial = device_peripherals 
+            .USART3
+            .serial(
+                (tx_pin, rx_pin),
+                Config::default().baudrate(9600.bps()).wordlength_9(),
+                &clocks,
+            )
+            .unwrap()
+            .with_u16_data();
+  
+        //serial.listen(Rxne);
 
-        let spi3 = Spi::new_slave(spi, (sck, miso, mosi), mode, 8.MHz(), &clocks);
-
-        let (tx, rx) = spi3.use_dma().txrx();
-
-        // Initialize the DMA
-        let streams = StreamsTuple::new(device_peripherals.DMA1);
-        let tx_stream = streams.5;
-        let rx_stream = streams.0;
-
-        let rx_buffer = cortex_m::singleton!(: [u8; ARRAY_SIZE] = [0; ARRAY_SIZE]).unwrap();
-        let tx_buffer = cortex_m::singleton!(: [u8; ARRAY_SIZE] = [1,2,3]).unwrap();
-
-        let mut rx_transfer = Transfer::init_peripheral_to_memory(
-            rx_stream,
-            rx,
-            rx_buffer,
-            None,
-            DmaConfig::default()
-                .memory_increment(true)
-                .fifo_enable(true)
-                .fifo_error_interrupt(true)
-                .transfer_complete_interrupt(true),
-        );
-
-        let mut tx_transfer = Transfer::init_memory_to_peripheral(
-            tx_stream,
-            tx,
-            tx_buffer,
-            None,
-            DmaConfig::default()
-                .memory_increment(true)
-                .fifo_enable(true)
-                .fifo_error_interrupt(true)
-                .transfer_complete_interrupt(true),
-        );
-
-        rx_transfer.start(|_rx| {});
-        tx_transfer.start(|_tx| {});
+        let (mut tx, mut rx) = serial.split();
 
         // Initialize the buffer for rx/tx
         let rx_buffer2 = cortex_m::singleton!(: [u8; ARRAY_SIZE] = [0; ARRAY_SIZE]).unwrap();
         let tx_buffer2 = cortex_m::singleton!(: [u8; ARRAY_SIZE] = [4,5,6]).unwrap();
 
-        let gpiod = device_peripherals.GPIOD.split();
         let mut led = gpiod.pd12.into_push_pull_output();
+
+        rx.listen_idle();
+        //rx.listen_idle();
+        
+        pac::NVIC::unpend(pac::Interrupt::USART3);
+        
+        unsafe {
+            pac::NVIC::unmask(pac::Interrupt::USART3);
+        }
 
         (Shared {
             led: led,
-            tx_transfer: tx_transfer,
-            rx_transfer: rx_transfer
+            led_state: false,
+            tx_transfer: tx,
+            rx_transfer: rx
         }, Local {
             rx_buffer: Some(tx_buffer2),
             tx_buffer: Some(rx_buffer2)
         }, init::Monotonics(mono))
     }
 
-    #[task(binds = DMA1_STREAM0, shared = [rx_transfer, led], local = [rx_buffer])]
+    #[task(binds = USART3, shared = [rx_transfer, tx_transfer, led, led_state], local = [rx_buffer])]
     fn on_receiving(cx: on_receiving::Context) {
         let on_receiving::Context { mut shared, local } = cx;
-        if Stream0::<DMA1>::get_fifo_error_flag() {
-            shared
-                .rx_transfer
-                .lock(|spi_dma| spi_dma.clear_fifo_error_interrupt());
-        }
-        if Stream0::<DMA1>::get_transfer_complete_flag() {
-            shared
-                .rx_transfer
-                .lock(|spi_dma| spi_dma.clear_transfer_complete_interrupt());
-            let filled_buffer = shared.rx_transfer.lock(|spi_dma| {
-                let (result, _) = spi_dma
-                    .next_transfer(local.rx_buffer.take().unwrap())
-                    .unwrap();
-                result
-            });
-            match filled_buffer[0] {
-                1 => shared.led.lock(|led| led.set_low()),
-                _ => shared.led.lock(|led| led.set_high()),
-            }
-            *local.rx_buffer = Some(filled_buffer);
-        }
+        shared.led.lock(|led| led.toggle());
+        shared.rx_transfer.lock(|rx| rx.clear_idle_interrupt());
     }
 
 }
