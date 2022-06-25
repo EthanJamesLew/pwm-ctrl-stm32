@@ -6,6 +6,8 @@
 // signal generator is an rtic app
 #[rtic::app(device = stm32f4xx_hal::pac, peripherals = true, dispatchers = [TIM5])]
 mod app {
+    use core::fmt::write;
+
     /// hardware layers imports
     use embedded_hal::spi::{Mode, Phase, Polarity};
     use stm32f4xx_hal::{
@@ -32,38 +34,10 @@ mod app {
     use stm32f4xx_hal as hal;
     use heapless::String;
 
-    /// buffer for RX
-    pub struct CharBuilder {
-        buffer: [char; 32],
-        length: usize
-    }
-   
-    impl CharBuilder {
-        pub fn new() -> Self {
-            Self{buffer: [(0u8 as char); 32], length: 0}
-        }
-
-        pub fn submit_char(&mut self, c: char) {
-            if c as u8 == 13 {
-                self.length = 0;
-                self.buffer[self.length] = c;
-            } else {
-                if self.length >= 32 {
-                    self.length = 0;
-                }
-                self.buffer[self.length] = c;
-                self.length += 1;
-            }
-        }
-
-        pub fn string(&self) -> &[char] {
-            let r = &self.buffer[0..self.length];
-            r
-        }
-    }
-
     /// app constants
     const ARRAY_SIZE: usize = 3;
+    const STRING_SIZE: usize = 64;
+    type HString = String::<STRING_SIZE>; 
 
     #[local]
     struct Local {
@@ -76,7 +50,7 @@ mod app {
         led_state: bool,
         tx_transfer: Tx<USART3, u16>,
         rx_transfer: Rx<USART3, u16>,
-        command: CharBuilder
+        command: HString 
     }
 
     #[monotonic(binds = SysTick, default = true)]
@@ -129,7 +103,7 @@ mod app {
             led_state: false,
             tx_transfer: tx,
             rx_transfer: rx,
-            command: CharBuilder::new()
+            command: String::<STRING_SIZE>::from("") 
         }, Local {
             rx_buffer: Some(tx_buffer2),
         }, init::Monotonics(mono))
@@ -166,7 +140,14 @@ mod app {
                     if cchar as u8 == 13 {
                         print_command::spawn().unwrap();
                     } else {
-                        shared.command.lock(|comm| comm.submit_char(cchar));
+                        shared.tx_transfer.lock(|tx| write_char(tx, cchar));
+                        shared.command.lock(|comm| {
+                            let s_res = comm.push(cchar);
+                            match s_res {
+                                Ok(_) => (),
+                                Err(e) => hprintln!("String Push Error {:?}", e),
+                            }
+                        });
                     }
                 },
                 Err(_) => (),
@@ -178,18 +159,13 @@ mod app {
     fn print_command(cx: print_command::Context) {
         let print_command::Context { mut shared} = cx;
         shared.command.lock(|comm| {
-            let mut s= String::<32>::from("");
-            for c in comm.string() {
-                shared.tx_transfer.lock(|tx| write_char(tx, *c));
-                let s_res = s.push(*c);
-                match s_res {
-                    Ok(_) => (),
-                    Err(e) => hprintln!("String Push Error {:?}", e),
-                }
+            shared.tx_transfer.lock(|tx| {write_char(tx, 10 as char); write_char(tx, 13 as char)});
+            for c in comm.chars() {
+                shared.tx_transfer.lock(|tx| write_char(tx, c));
             }
             shared.tx_transfer.lock(|tx| {write_char(tx, 10 as char); write_char(tx, 13 as char)});
             //hprintln!("Received Command: {}", s.as_str());
-            comm.submit_char(13 as char);
+            comm.clear();
         });
     }
 
