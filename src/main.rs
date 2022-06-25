@@ -8,36 +8,33 @@
 mod app {
     use core::fmt::write;
 
+    use cortex_m_semihosting::{hprint, hprintln};
     /// hardware layers imports
     use embedded_hal::spi::{Mode, Phase, Polarity};
+    use heapless::String;
+    use panic_semihosting as _;
+    use stm32f4xx_hal as hal;
     use stm32f4xx_hal::{
         block,
-        spi::{Spi},
-        pac::{DMA1, SPI3, USART3},
-        gpio::{gpiod::PD12, Output, PushPull},
         dma::{
-            StreamsTuple, config::DmaConfig, 
-            Transfer, PeripheralToMemory, 
-            MemoryToPeripheral, Stream0, Stream5,
-            traits::StreamISR
+            config::DmaConfig, traits::StreamISR, MemoryToPeripheral, PeripheralToMemory, Stream0,
+            Stream5, StreamsTuple, Transfer,
         },
-        interrupt,
-        serial::{config::Config, Tx, Rx, Event::Rxne},
-        serial,
+        gpio::{gpiod::PD12, Output, PushPull},
+        interrupt, pac,
+        pac::{DMA1, SPI3, USART3},
         prelude::*,
         rng::ErrorKind,
-        pac,
+        serial,
+        serial::{config::Config, Event::Rxne, Rx, Tx},
+        spi::Spi,
     };
-    use cortex_m_semihosting::{hprintln, hprint};
-    use panic_semihosting as _;
     use systick_monotonic::*;
-    use stm32f4xx_hal as hal;
-    use heapless::String;
 
     /// app constants
     const ARRAY_SIZE: usize = 3;
     const STRING_SIZE: usize = 64;
-    type HString = String::<STRING_SIZE>; 
+    type HString = String<STRING_SIZE>;
 
     #[local]
     struct Local {
@@ -50,7 +47,7 @@ mod app {
         led_state: bool,
         tx_transfer: Tx<USART3, u16>,
         rx_transfer: Rx<USART3, u16>,
-        command: HString 
+        command: HString,
     }
 
     #[monotonic(binds = SysTick, default = true)]
@@ -77,7 +74,7 @@ mod app {
         let rx_pin = gpiod.pd9.into_alternate();
 
         // configure serial
-        let serial = device_peripherals 
+        let serial = device_peripherals
             .USART3
             .serial(
                 (tx_pin, rx_pin),
@@ -86,7 +83,7 @@ mod app {
             )
             .unwrap()
             .with_u16_data();
-  
+
         //serial.listen(Rxne);
 
         let (tx, mut rx) = serial.split();
@@ -98,15 +95,19 @@ mod app {
 
         rx.listen_idle();
 
-        (Shared {
-            led: led,
-            led_state: false,
-            tx_transfer: tx,
-            rx_transfer: rx,
-            command: String::<STRING_SIZE>::from("") 
-        }, Local {
-            rx_buffer: Some(tx_buffer2),
-        }, init::Monotonics(mono))
+        (
+            Shared {
+                led: led,
+                led_state: false,
+                tx_transfer: tx,
+                rx_transfer: rx,
+                command: String::<STRING_SIZE>::from(""),
+            },
+            Local {
+                rx_buffer: Some(tx_buffer2),
+            },
+            init::Monotonics(mono),
+        )
     }
 
     #[inline(always)]
@@ -130,7 +131,10 @@ mod app {
 
     #[task(binds = USART3, shared = [rx_transfer, tx_transfer, led, led_state, command], local = [rx_buffer])]
     fn on_receiving(cx: on_receiving::Context) {
-        let on_receiving::Context { mut shared, local: _ } = cx;
+        let on_receiving::Context {
+            mut shared,
+            local: _,
+        } = cx;
         shared.led.lock(|led| led.toggle());
         shared.rx_transfer.lock(|rx| {
             let res = read_char(rx);
@@ -149,7 +153,7 @@ mod app {
                             }
                         });
                     }
-                },
+                }
                 Err(_) => (),
             };
         });
@@ -157,17 +161,21 @@ mod app {
 
     #[task(shared = [command, tx_transfer])]
     fn print_command(cx: print_command::Context) {
-        let print_command::Context { mut shared} = cx;
+        let print_command::Context { mut shared } = cx;
         shared.command.lock(|comm| {
-            shared.tx_transfer.lock(|tx| {write_char(tx, 10 as char); write_char(tx, 13 as char)});
+            shared.tx_transfer.lock(|tx| {
+                write_char(tx, 10 as char);
+                write_char(tx, 13 as char)
+            });
             for c in comm.chars() {
                 shared.tx_transfer.lock(|tx| write_char(tx, c));
             }
-            shared.tx_transfer.lock(|tx| {write_char(tx, 10 as char); write_char(tx, 13 as char)});
+            shared.tx_transfer.lock(|tx| {
+                write_char(tx, 10 as char);
+                write_char(tx, 13 as char)
+            });
             //hprintln!("Received Command: {}", s.as_str());
             comm.clear();
         });
     }
-
-
 }
