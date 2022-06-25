@@ -9,6 +9,7 @@ mod app {
     /// hardware layers imports
     use embedded_hal::spi::{Mode, Phase, Polarity};
     use stm32f4xx_hal::{
+        block,
         spi::{Spi},
         pac::{DMA1, SPI3, USART3},
         gpio::{gpiod::PD12, Output, PushPull},
@@ -20,19 +21,52 @@ mod app {
         },
         interrupt,
         serial::{config::Config, Tx, Rx, Event::Rxne},
+        serial,
         prelude::*,
+        rng::ErrorKind,
         pac,
     };
+    use cortex_m_semihosting::{hprintln, hprint};
     use panic_semihosting as _;
     use systick_monotonic::*;
     use stm32f4xx_hal as hal;
+    use heapless::String;
+
+    /// buffer for RX
+    pub struct CharBuilder {
+        buffer: [char; 32],
+        length: usize
+    }
+   
+    impl CharBuilder {
+        pub fn new() -> Self {
+            Self{buffer: [(0u8 as char); 32], length: 0}
+        }
+
+        pub fn submit_char(&mut self, c: char) {
+            if c as u8 == 13 {
+                self.length = 0;
+                self.buffer[self.length] = c;
+            } else {
+                if self.length >= 32 {
+                    self.length = 0;
+                }
+                self.buffer[self.length] = c;
+                self.length += 1;
+            }
+        }
+
+        pub fn string(&self) -> &[char] {
+            let r = &self.buffer[0..self.length];
+            r
+        }
+    }
 
     /// app constants
     const ARRAY_SIZE: usize = 3;
 
     #[local]
     struct Local {
-        tx_buffer: Option<&'static mut [u8; ARRAY_SIZE]>,
         rx_buffer: Option<&'static mut [u8; ARRAY_SIZE]>,
     }
 
@@ -42,6 +76,7 @@ mod app {
         led_state: bool,
         tx_transfer: Tx<USART3, u16>,
         rx_transfer: Rx<USART3, u16>,
+        command: CharBuilder
     }
 
     #[monotonic(binds = SysTick, default = true)]
@@ -57,7 +92,7 @@ mod app {
         let device_peripherals: hal::pac::Peripherals = cx.device;
         let rcc = device_peripherals.RCC;
         let rcc = rcc.constrain();
-        let clocks = rcc.cfgr.use_hse(8.MHz()).freeze();
+        let clocks = rcc.cfgr.sysclk(168.MHz()).use_hse(8.MHz()).freeze();
 
         // RTIC monotonic
         let mono = Systick::new(core.SYST, 100_000_000);
@@ -68,11 +103,11 @@ mod app {
         let rx_pin = gpiod.pd9.into_alternate();
 
         // configure serial
-        let mut serial = device_peripherals 
+        let serial = device_peripherals 
             .USART3
             .serial(
                 (tx_pin, rx_pin),
-                Config::default().baudrate(9600.bps()).wordlength_9(),
+                Config::default().baudrate(115_200.bps()).wordlength_9(),
                 &clocks,
             )
             .unwrap()
@@ -80,39 +115,83 @@ mod app {
   
         //serial.listen(Rxne);
 
-        let (mut tx, mut rx) = serial.split();
+        let (tx, mut rx) = serial.split();
 
         // Initialize the buffer for rx/tx
-        let rx_buffer2 = cortex_m::singleton!(: [u8; ARRAY_SIZE] = [0; ARRAY_SIZE]).unwrap();
         let tx_buffer2 = cortex_m::singleton!(: [u8; ARRAY_SIZE] = [4,5,6]).unwrap();
 
-        let mut led = gpiod.pd12.into_push_pull_output();
+        let led = gpiod.pd12.into_push_pull_output();
 
         rx.listen_idle();
-        //rx.listen_idle();
-        
-        pac::NVIC::unpend(pac::Interrupt::USART3);
-        
-        unsafe {
-            pac::NVIC::unmask(pac::Interrupt::USART3);
-        }
 
         (Shared {
             led: led,
             led_state: false,
             tx_transfer: tx,
-            rx_transfer: rx
+            rx_transfer: rx,
+            command: CharBuilder::new()
         }, Local {
             rx_buffer: Some(tx_buffer2),
-            tx_buffer: Some(rx_buffer2)
         }, init::Monotonics(mono))
     }
 
-    #[task(binds = USART3, shared = [rx_transfer, tx_transfer, led, led_state], local = [rx_buffer])]
-    fn on_receiving(cx: on_receiving::Context) {
-        let on_receiving::Context { mut shared, local } = cx;
-        shared.led.lock(|led| led.toggle());
-        shared.rx_transfer.lock(|rx| rx.clear_idle_interrupt());
+    #[inline(always)]
+    fn write_char(tx: &mut Tx<USART3, u16>, c: char) {
+        let terr = block!(tx.write(c as u16));
+        match terr {
+            Ok(_) => (),
+            Err(e) => hprintln!("UART Tx Error {:?}", e),
+        }
     }
+
+    #[inline(always)]
+    fn read_char(rx: &mut Rx<USART3, u16>) -> Result<u16, serial::Error> {
+        let res = block!(rx.read());
+        match res {
+            Ok(_) => (),
+            Err(e) => hprintln!("Uart Rx Error {:?}", e),
+        };
+        res
+    }
+
+    #[task(binds = USART3, shared = [rx_transfer, tx_transfer, led, led_state, command], local = [rx_buffer])]
+    fn on_receiving(cx: on_receiving::Context) {
+        let on_receiving::Context { mut shared, local: _ } = cx;
+        shared.led.lock(|led| led.toggle());
+        shared.rx_transfer.lock(|rx| {
+            let res = read_char(rx);
+            match res {
+                Ok(c) => {
+                    let cchar = ((c & 0xFF) as u8) as char;
+                    if cchar as u8 == 13 {
+                        print_command::spawn().unwrap();
+                    } else {
+                        shared.command.lock(|comm| comm.submit_char(cchar));
+                    }
+                },
+                Err(_) => (),
+            };
+        });
+    }
+
+    #[task(shared = [command, tx_transfer])]
+    fn print_command(cx: print_command::Context) {
+        let print_command::Context { mut shared} = cx;
+        shared.command.lock(|comm| {
+            let mut s= String::<32>::from("");
+            for c in comm.string() {
+                shared.tx_transfer.lock(|tx| write_char(tx, *c));
+                let s_res = s.push(*c);
+                match s_res {
+                    Ok(_) => (),
+                    Err(e) => hprintln!("String Push Error {:?}", e),
+                }
+            }
+            shared.tx_transfer.lock(|tx| {write_char(tx, 10 as char); write_char(tx, 13 as char)});
+            //hprintln!("Received Command: {}", s.as_str());
+            comm.submit_char(13 as char);
+        });
+    }
+
 
 }
