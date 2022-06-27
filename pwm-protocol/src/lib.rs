@@ -5,6 +5,47 @@ pub mod serial_config {
     pub const BAUDRATE: u32 = 115_200;
 }
 
+pub mod lut {
+    use core::f32::consts::FRAC_PI_2;
+    use heapless::Vec;
+    use micromath::F32Ext;
+
+    pub const MAX_TABLE_SIZE: usize = 512;
+    pub const DEFAULT_FREQ: u32 = 15_360;
+
+    pub struct SignalConfig {
+        pub pwm_freq: u32,
+        pub max_duty: u16,
+        pub table_size: usize,
+        pub shifts: [usize; 16],
+    }
+
+    impl SignalConfig {
+        pub fn default(max_duty: u16) -> Self {
+            Self {
+                pwm_freq: DEFAULT_FREQ,
+                max_duty: max_duty,
+                table_size: 256,
+                shifts: [0; 16],
+            }
+        }
+
+        pub fn generate_lut(&self) -> Option<Vec<u16, MAX_TABLE_SIZE>> {
+            let mut v = Vec::<u16, MAX_TABLE_SIZE>::new();
+            let a = (4.0 * FRAC_PI_2) / (self.table_size as f32);
+            for i in 0..self.table_size {
+                let angle = a * (i as f32);
+                let p_op = v.push(((angle.sin() / 2.0 + 0.5) * (self.max_duty as f32)) as u16);
+                match p_op {
+                    Ok(_) => (),
+                    Err(_) => return None,
+                }
+            }
+            Some(v)
+        }
+    }
+}
+
 /// Command model for serial C&C
 pub mod command {
 

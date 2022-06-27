@@ -381,6 +381,10 @@ dependencies = [
 [[package]]
 name = "pwm_protocol"
 version = "0.1.0"
+dependencies = [
+ "heapless",
+ "micromath",
+]
 
 [[package]]
 name = "quote"
