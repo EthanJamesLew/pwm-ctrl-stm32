@@ -1,5 +1,7 @@
 # 16 Channel PWM Sinusiodal PWM Controller
 
+![pwm waveforms viewed on an oscilloscope](./doc/img/pwm_oscope.jpg)
+
 An experiment to make a PWM controller in embedded Rust for the STM32F407 Discovery board.
 
 ## Usage
