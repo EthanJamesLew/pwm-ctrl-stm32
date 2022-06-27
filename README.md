@@ -1,4 +1,4 @@
-# 16 Channel PWM Sinusiodal PWM Controller
+# 16 Channel Sinusoidal PWM Controller
 
 ![pwm waveforms viewed on an oscilloscope](./doc/img/pwm_oscope.jpg)
 
