@@ -379,6 +379,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pwm_protocol"
+version = "0.1.0"
+
+[[package]]
 name = "quote"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -550,6 +554,7 @@ dependencies = [
  "micromath",
  "panic-rtt-target",
  "panic-semihosting",
+ "pwm_protocol",
  "rtt-target",
  "stm32f4xx-hal",
  "systick-monotonic",
