@@ -1,38 +1,188 @@
-#![deny(unsafe_code)]
+#![allow(unsafe_code)]
+#![allow(unused_imports)]
 #![no_main]
 #![no_std]
-/// STM32F407 16 Channel PWM Code
-// Halt on panic
-use panic_halt as _;
 
-use core::f32::consts::FRAC_PI_2;
-use cortex_m_rt::entry;
-use micromath::F32Ext;
-use stm32f4xx_hal::{pac, prelude::*, timer::Channel};
+// signal generator is an rtic app
+#[rtic::app(device = stm32f4xx_hal::pac, peripherals = true, dispatchers = [TIM5])]
+mod app {
+    // hardware layers imports
+    use core::fmt::write;
+    use cortex_m_semihosting::{hprint, hprintln};
+    use embedded_hal::spi::{Mode, Phase, Polarity};
+    use heapless::Vec;
+    use panic_semihosting as _;
+    use pwm_protocol::command::{PwmCommand, PwmOpCode};
+    use pwm_protocol::lut;
+    use pwm_protocol::serial_config;
+    use stm32f4xx_hal as hal;
+    use stm32f4xx_hal::{
+        block,
+        dma::{
+            config::DmaConfig, traits::StreamISR, MemoryToPeripheral, PeripheralToMemory, Stream1,
+            StreamsTuple, Transfer,
+        },
+        gpio::{gpiod::PD12, Alternate, Output, Pin, PushPull},
+        interrupt, pac,
+        pac::{DMA1, SPI3, USART3},
+        prelude::*,
+        rng::ErrorKind,
+        serial,
+        serial::{config::Config, Event::Rxne, Rx, Tx},
+        spi::Spi,
+        timer::{Ch, Channel, Pwm},
+    };
+    use systick_monotonic::{Systick, fugit};
 
-/// program constants
-const PWM_FREQ: u32 = 15_360;
-const TABLE_SIZE: usize = 256;
-const SHIFT: usize = 0;
+    // app constants
+    const ARRAY_SIZE: usize = 4;
 
-/// fast modulus - inside of the fast running update loop
-#[inline(always)]
-fn fast_mod(n: usize, d: usize) -> usize {
-    n & (d - 1)
-}
+    // app resources local to specific tasks
+    #[local]
+    struct Local {
+        rx_buffer: Option<&'static mut [u8; ARRAY_SIZE]>,
+        count: usize,
+    }
 
-/// 16 Channel PWM
-#[entry]
-fn main() -> ! {
-    if let Some(dp) = pac::Peripherals::take() {
-        // Set up the system clock and timing
-        let rcc = dp.RCC.constrain();
-        let clocks = rcc.cfgr.sysclk(168.MHz()).freeze();
-        let uperiod = ((1.0 / (PWM_FREQ as f32)) * 1E6) as u32;
+    // app resources shared between tasks
+    #[shared]
+    struct Shared {
+        led: PD12<Output<PushPull>>,
+        tx_transfer: Tx<USART3, u8>,
+        rx_transfer: Transfer<
+            Stream1<DMA1>,
+            4_u8,
+            Rx<USART3>,
+            PeripheralToMemory,
+            &'static mut [u8; ARRAY_SIZE],
+        >,
+        pwm0: Pwm<
+            pac::TIM1,
+            (Ch<0_u8>, Ch<1_u8>, Ch<2_u8>, Ch<3_u8>),
+            (
+                Pin<'A', 8_u8, Alternate<1_u8>>,
+                Pin<'A', 9_u8, Alternate<1_u8>>,
+                Pin<'A', 10_u8, Alternate<1_u8>>,
+                Pin<'A', 11_u8, Alternate<1_u8>>,
+            ),
+            1000000_u32,
+        >,
+        pwm1: Pwm<
+            pac::TIM2,
+            (Ch<0_u8>, Ch<1_u8>, Ch<2_u8>, Ch<3_u8>),
+            (
+                Pin<'A', 5_u8, Alternate<1_u8>>,
+                Pin<'A', 1_u8, Alternate<1_u8>>,
+                Pin<'A', 2_u8, Alternate<1_u8>>,
+                Pin<'A', 3_u8, Alternate<1_u8>>,
+            ),
+            1000000_u32,
+        >,
+        pwm2: Pwm<
+            pac::TIM3,
+            (Ch<0_u8>, Ch<1_u8>, Ch<2_u8>, Ch<3_u8>),
+            (
+                Pin<'A', 6_u8, Alternate<2_u8>>,
+                Pin<'A', 7_u8, Alternate<2_u8>>,
+                Pin<'B', 0_u8, Alternate<2_u8>>,
+                Pin<'B', 1_u8, Alternate<2_u8>>,
+            ),
+            1000000_u32,
+        >,
+        pwm3: Pwm<
+            pac::TIM4,
+            (Ch<0_u8>, Ch<1_u8>, Ch<2_u8>, Ch<3_u8>),
+            (
+                Pin<'B', 6_u8, Alternate<2_u8>>,
+                Pin<'B', 7_u8, Alternate<2_u8>>,
+                Pin<'B', 8_u8, Alternate<2_u8>>,
+                Pin<'B', 9_u8, Alternate<2_u8>>,
+            ),
+            1000000_u32,
+        >,
+        signal_lut: Vec<u16, 512>,
+        pwm_config: lut::SignalConfig,
+    }
+
+    // RTIC runtime timer -- timing for tasks
+    #[monotonic(binds = SysTick, default = true)]
+    type SMonotonic = Systick<200_000>; // 1000 Hz / 1 ms granularity
+
+    #[init()]
+    fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
+        // configure data watchpoint
+        let mut core = cx.core;
+        core.DWT.enable_cycle_counter();
+
+        // Initialize the clocks
+        let device_peripherals: hal::pac::Peripherals = cx.device;
+        let rcc = device_peripherals.RCC;
+        let rcc = rcc.constrain();
+        let clocks = rcc.cfgr.sysclk(100.MHz()).use_hse(8.MHz()).freeze();
+
+        // RTIC monotonic
+        let mono = Systick::new(core.SYST, 100_000_000);
+
+        // define RX/TX pins
+        let gpiod = device_peripherals.GPIOD.split();
+        let tx_pin = gpiod.pd8.into_alternate();
+        let rx_pin = gpiod.pd9.into_alternate();
+
+        // configure serial
+        // 115200 baud rate using 8N1 words
+        let serial = device_peripherals
+            .USART3
+            .serial(
+                (tx_pin, rx_pin),
+                Config::default()
+                    .baudrate(serial_config::BAUDRATE.bps())
+                    .dma(serial::config::DmaConfig::Rx),
+                &clocks,
+            )
+            .unwrap();
+        // get the serial Rx/Tx as their own peripherals
+        let (tx, rx) = serial.split();
+
+        // For USART3 Using DMA, use DMA1, Stream 1
+        // RM0090 Rev 19, pp 307
+        let streams = StreamsTuple::new(device_peripherals.DMA1);
+        let rx_stream = streams.1;
+
+        // buffer that the DMA USART3 Rx will populate
+        let rx_buffer = cortex_m::singleton!(: [u8; ARRAY_SIZE] = [0; ARRAY_SIZE]).unwrap();
+
+        // configure the DMA and setup the transfer from the peripheral
+        // RM0090 Rev 19, pp 322
+        // Peripheral-to-Memory, FIFO Mode
+        // Priority Medium
+        // Memory Increment
+        // 1/4 FIFO threshold
+        // No Bursts
+        // start the DMA immediately
+        let mut rx_transfer = Transfer::init_peripheral_to_memory(
+            rx_stream,
+            rx,
+            rx_buffer,
+            None,
+            DmaConfig::default()
+                .memory_increment(true)
+                .fifo_enable(true)
+                .fifo_error_interrupt(true)
+                .transfer_complete_interrupt(true),
+        );
+        rx_transfer.start(|_rx| {});
+
+        // Initialize the buffer for rx/tx
+        let rx_buffer2 = cortex_m::singleton!(: [u8; ARRAY_SIZE] = [0; ARRAY_SIZE]).unwrap();
+
+        let led = gpiod.pd12.into_push_pull_output();
+
+        // PWM Stuff
+        let uperiod = ((1.0 / (lut::DEFAULT_FREQ as f32)) * 1E6) as u32;
 
         // GPIO blocks involved
-        let gpioa = dp.GPIOA.split();
-        let gpiob = dp.GPIOB.split();
+        let gpioa = device_peripherals.GPIOA.split();
+        let gpiob = device_peripherals.GPIOB.split();
 
         // channels (gpio) that we will use for the signal
         let channels0 = (
@@ -61,27 +211,18 @@ fn main() -> ! {
         );
 
         // build PWM HAL interfaces
-        let mut pwm0 = dp.TIM1.pwm_us(channels0, uperiod.micros(), &clocks);
-        let mut pwm1 = dp.TIM2.pwm_us(channels1, uperiod.micros(), &clocks);
-        let mut pwm2 = dp.TIM3.pwm_us(channels2, uperiod.micros(), &clocks);
-        let mut pwm3 = dp.TIM4.pwm_us(channels3, uperiod.micros(), &clocks);
-
-        let mut counter = dp.TIM5.counter_us(&clocks);
-        let max_duty = pwm0.get_max_duty();
-
-        // build the PWM LUT
-        const N: usize = TABLE_SIZE;
-        let mut sin_a = [0_u16; N + 1];
-
-        // fill sinus array
-        let a = (4.0 * FRAC_PI_2) / (N as f32);
-        for (i, b) in sin_a.iter_mut().enumerate() {
-            let angle = a * (i as f32);
-            *b = ((angle.sin() / 2.0 + 0.500) * (max_duty as f32)) as u16;
-        }
-
-        // counter will be the loop update time
-        counter.start(uperiod.micros()).unwrap();
+        let mut pwm0 = device_peripherals
+            .TIM1
+            .pwm_us(channels0, uperiod.micros(), &clocks);
+        let mut pwm1 = device_peripherals
+            .TIM2
+            .pwm_us(channels1, uperiod.micros(), &clocks);
+        let mut pwm2 = device_peripherals
+            .TIM3
+            .pwm_us(channels2, uperiod.micros(), &clocks);
+        let mut pwm3 = device_peripherals
+            .TIM4
+            .pwm_us(channels3, uperiod.micros(), &clocks);
 
         // enable the channels
         pwm0.enable(Channel::C1);
@@ -104,48 +245,187 @@ fn main() -> ! {
         pwm2.enable(Channel::C4);
         pwm3.enable(Channel::C4);
 
-        let mut i = 0;
-        loop {
-            nb::block!(counter.wait()).unwrap();
+        let max_duty = pwm0.get_max_duty();
+        let pwm_config = lut::SignalConfig::default(max_duty);
+        let signal_lut = pwm_config.generate_lut().unwrap();
 
-            // compute indices
-            let (j0, j1, j2, j3) = (
-                fast_mod(i, N),
-                fast_mod(i + SHIFT, N),
-                fast_mod(i + 2 * SHIFT, N),
-                fast_mod(i + 3 * SHIFT, N),
+        update_duty::spawn_after(fugit::Duration:: <u64,1,200_000> ::from_ticks(1)).ok();
+
+        // setup the RTIC resources
+        (
+            Shared {
+                led: led,
+                tx_transfer: tx,
+                rx_transfer: rx_transfer,
+                pwm0: pwm0,
+                pwm1: pwm1,
+                pwm2: pwm2,
+                pwm3: pwm3,
+                signal_lut: signal_lut,
+                pwm_config: pwm_config,
+            },
+            Local {
+                rx_buffer: Some(rx_buffer2),
+                count: 0,
+            },
+            init::Monotonics(mono),
+        )
+    }
+
+    /// fast modulus - inside of the fast running update loop
+    #[inline(always)]
+    fn fast_mod(n: usize, d: usize) -> usize {
+        n & (d - 1)
+    }
+
+    #[task(shared = [pwm0, pwm1, pwm2, pwm3, signal_lut, pwm_config], local=[count])]
+    fn update_duty(cx: update_duty::Context) {
+        let update_duty::Context { mut shared, local } = cx;
+
+        // compute indices
+        let count = *local.count;
+
+        shared.pwm_config.lock(|config| {
+            // calculate the table indices
+            let (j0, j1, j2, j3, j4, j5, j6, j7, j8, j9, j10, j11, j12, j13, j14, j15) = (
+                fast_mod(count + config.shifts[0], config.table_size),
+                fast_mod(count + config.shifts[1], config.table_size),
+                fast_mod(count + config.shifts[2], config.table_size),
+                fast_mod(count + config.shifts[3], config.table_size),
+                fast_mod(count + config.shifts[4], config.table_size),
+                fast_mod(count + config.shifts[5], config.table_size),
+                fast_mod(count + config.shifts[6], config.table_size),
+                fast_mod(count + config.shifts[7], config.table_size),
+                fast_mod(count + config.shifts[8], config.table_size),
+                fast_mod(count + config.shifts[9], config.table_size),
+                fast_mod(count + config.shifts[10], config.table_size),
+                fast_mod(count + config.shifts[11], config.table_size),
+                fast_mod(count + config.shifts[12], config.table_size),
+                fast_mod(count + config.shifts[13], config.table_size),
+                fast_mod(count + config.shifts[14], config.table_size),
+                fast_mod(count + config.shifts[15], config.table_size),
             );
 
             // set channels
-            pwm0.set_duty(Channel::C1, sin_a[j0]);
-            pwm0.set_duty(Channel::C2, sin_a[j1]);
-            pwm0.set_duty(Channel::C3, sin_a[j2]);
-            pwm0.set_duty(Channel::C4, sin_a[j3]);
+            shared.signal_lut.lock(|signal_lut| {
+                shared.pwm0.lock(|pwm| {
+                    pwm.set_duty(Channel::C1, signal_lut[j0]);
+                    pwm.set_duty(Channel::C2, signal_lut[j1]);
+                    pwm.set_duty(Channel::C3, signal_lut[j2]);
+                    pwm.set_duty(Channel::C4, signal_lut[j3]);
+                });
 
-            pwm1.set_duty(Channel::C1, sin_a[j0]);
-            pwm1.set_duty(Channel::C2, sin_a[j1]);
-            pwm1.set_duty(Channel::C3, sin_a[j2]);
-            pwm1.set_duty(Channel::C4, sin_a[j3]);
+                shared.pwm1.lock(|pwm| {
+                    pwm.set_duty(Channel::C1, signal_lut[j4]);
+                    pwm.set_duty(Channel::C2, signal_lut[j5]);
+                    pwm.set_duty(Channel::C3, signal_lut[j6]);
+                    pwm.set_duty(Channel::C4, signal_lut[j7]);
+                });
 
-            pwm2.set_duty(Channel::C1, sin_a[j0]);
-            pwm2.set_duty(Channel::C2, sin_a[j1]);
-            pwm2.set_duty(Channel::C3, sin_a[j2]);
-            pwm2.set_duty(Channel::C4, sin_a[j3]);
+                shared.pwm2.lock(|pwm| {
+                    pwm.set_duty(Channel::C1, signal_lut[j8]);
+                    pwm.set_duty(Channel::C2, signal_lut[j9]);
+                    pwm.set_duty(Channel::C3, signal_lut[j10]);
+                    pwm.set_duty(Channel::C4, signal_lut[j11]);
+                });
 
-            pwm3.set_duty(Channel::C1, sin_a[j0]);
-            pwm3.set_duty(Channel::C2, sin_a[j1]);
-            pwm3.set_duty(Channel::C3, sin_a[j2]);
-            pwm3.set_duty(Channel::C4, sin_a[j3]);
+                shared.pwm3.lock(|pwm| {
+                    pwm.set_duty(Channel::C1, signal_lut[j12]);
+                    pwm.set_duty(Channel::C2, signal_lut[j13]);
+                    pwm.set_duty(Channel::C3, signal_lut[j14]);
+                    pwm.set_duty(Channel::C4, signal_lut[j15]);
+                });
 
-            // update loop increment (and mod it)
-            i += 1;
-            if i == N {
-                i -= N;
-            }
-        }
+                // update loop increment (and mod it)
+                *local.count += 1;
+                if *local.count == config.table_size {
+                    *local.count -= config.table_size;
+                };
+            });
+        });
+
+        // schedule the next update
+        shared.pwm_config.lock(|config| {
+            let period = ((200_000 as u64) / (config.pwm_freq as u64)) as u64;
+            update_duty::spawn_after(fugit::Duration:: <u64,1,200_000> ::from_ticks(period)).ok();
+        });
     }
 
-    loop {
-        cortex_m::asm::nop();
+    #[task(binds = DMA1_STREAM1, shared = [rx_transfer, tx_transfer, led, pwm_config, signal_lut], local = [rx_buffer])]
+    fn on_receiving(cx: on_receiving::Context) {
+        let on_receiving::Context { mut shared, local } = cx;
+
+        // attend to the interrupt based on the status register in the LISR
+        // RM0090 Rev 19, pp 325
+        if Stream1::<DMA1>::get_fifo_error_flag() {
+            shared
+                .rx_transfer
+                .lock(|serial_dma| serial_dma.clear_fifo_error_interrupt());
+        }
+        if Stream1::<DMA1>::get_transfer_complete_flag() {
+            shared
+                .rx_transfer
+                .lock(|serial_dma| serial_dma.clear_transfer_complete_interrupt());
+            let filled_buffer = shared.rx_transfer.lock(|serial_dma| {
+                let (result, _) = serial_dma
+                    .next_transfer(local.rx_buffer.take().unwrap())
+                    .unwrap();
+                result
+            });
+
+            // convert the filled buffer to a valid PWM command
+            let code_op = PwmOpCode::try_from_u8(filled_buffer[0]);
+
+            // process the command
+            match code_op {
+                Some(op) => {
+                    let command = PwmCommand {
+                        op: op,
+                        channel: filled_buffer[1],
+                        arg: ((filled_buffer[2] as u16) << 8) | filled_buffer[3] as u16,
+                    };
+                    match command.op {
+                        PwmOpCode::Frequency => {
+                            shared.pwm_config.lock(|config|{
+                                config.pwm_freq = command.arg as u32; 
+                            });
+                        },
+                        PwmOpCode::Phase => {
+                            shared.pwm_config.lock(|config|{
+                                let channel_idx = command.channel as usize;
+                                if channel_idx >= 16 {
+                                    hprintln!("invalid channel index");
+                                } else {
+                                    config.shifts[command.channel as usize] = command.arg as usize;
+                                }
+                            });
+                        },
+                        PwmOpCode::TableSize => {
+                            shared.pwm_config.lock(|config|{
+                                config.table_size = command.arg as usize;
+                                shared.signal_lut.lock(|lut|{
+                                    let lut_op = config.generate_lut();
+                                    match lut_op {
+                                        Some(l) => *lut = l,
+                                        _ => {
+                                            hprintln!("invalid table size");
+                                        }
+                                    }
+                                });
+                            });
+                        },
+                        _ => (), 
+                    };
+                    //hprintln!("{:?}", command);
+                }
+                None => {
+                    hprintln!("Invalid Code Received")
+                }
+            }
+
+            // switch out the buffers
+            *local.rx_buffer = Some(filled_buffer);
+            shared.led.lock(|led| led.toggle());
+        }
     }
 }
