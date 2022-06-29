@@ -275,17 +275,24 @@ mod app {
     /// fast modulus - inside of the fast running update loop
     #[inline(always)]
     fn fast_mod(n: usize, d: usize) -> usize {
-        n & (d - 1)
+        n % d
+        //n & (d - 1)
     }
 
     #[task(shared = [pwm0, pwm1, pwm2, pwm3, signal_lut, pwm_config], local=[count])]
     fn update_duty(cx: update_duty::Context) {
         let update_duty::Context { mut shared, local } = cx;
 
-        // compute indices
-        let count = *local.count;
-
         shared.pwm_config.lock(|config| {
+            // compute indices
+            let count = *local.count;
+        
+            // update loop increment (and mod it)
+            *local.count += 1;
+            if *local.count >= config.table_size {
+                *local.count = 0;
+            };
+
             // calculate the table indices
             let (j0, j1, j2, j3, j4, j5, j6, j7, j8, j9, j10, j11, j12, j13, j14, j15) = (
                 fast_mod(count + config.shifts[0], config.table_size),
@@ -336,11 +343,6 @@ mod app {
                     pwm.set_duty(Channel::C4, signal_lut[j15]);
                 });
 
-                // update loop increment (and mod it)
-                *local.count += 1;
-                if *local.count == config.table_size {
-                    *local.count -= config.table_size;
-                };
             });
         });
 
@@ -400,18 +402,36 @@ mod app {
                                 }
                             });
                         },
-                        PwmOpCode::TableSize => {
+                        PwmOpCode::Wavetype => {
                             shared.pwm_config.lock(|config|{
-                                config.table_size = command.arg as usize;
+                                config.signal_type = (command.arg as u8).into();
                                 shared.signal_lut.lock(|lut|{
                                     let lut_op = config.generate_lut();
                                     match lut_op {
                                         Some(l) => *lut = l,
                                         _ => {
-                                            hprintln!("invalid table size");
+                                            hprintln!("invalid wavetype");
                                         }
                                     }
                                 });
+                            });
+                        },
+                        PwmOpCode::TableSize => {
+                            shared.pwm_config.lock(|config|{
+                                if (command.arg as usize) > lut::MAX_TABLE_SIZE {
+                                    hprintln!("beyond max table size");
+                                } else {
+                                    config.table_size = command.arg as usize;
+                                    shared.signal_lut.lock(|lut|{
+                                        let lut_op = config.generate_lut();
+                                        match lut_op {
+                                            Some(l) => *lut = l,
+                                            _ => {
+                                                hprintln!("invalid table size");
+                                            }
+                                        }
+                                    });
+                                }
                             });
                         },
                         _ => (), 
